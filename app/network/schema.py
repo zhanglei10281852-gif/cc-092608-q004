@@ -133,6 +133,22 @@ CREATE TABLE IF NOT EXISTS session_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_session_events ON session_events(session_id,id);
+CREATE TABLE IF NOT EXISTS session_migrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES acceleration_sessions(id) ON DELETE CASCADE,
+    observation_key TEXT NOT NULL,
+    from_segment_id INTEGER REFERENCES network_segments(id),
+    to_segment_id INTEGER REFERENCES network_segments(id),
+    movement TEXT NOT NULL CHECK(movement IN ('forward','skip','back_swing','same_segment','out_of_order','regression')),
+    result TEXT NOT NULL CHECK(result IN ('migrated','held','ignored','rejected')),
+    reason TEXT NOT NULL DEFAULT '',
+    downlink_mbps REAL NOT NULL DEFAULT 0,
+    uplink_mbps REAL NOT NULL DEFAULT 0,
+    observed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, observation_key)
+);
+CREATE INDEX IF NOT EXISTS idx_session_migrations ON session_migrations(session_id,id);
 CREATE TABLE IF NOT EXISTS subscriber_entitlements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     subscriber_hash TEXT NOT NULL,

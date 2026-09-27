@@ -15,10 +15,11 @@ from app.network.schema import ensure_network_schema
 
 
 class NetworkAccelerationService:
-    def __init__(self, connection: sqlite3.Connection | None = None, clock: Clock | None = None) -> None:
+    def __init__(self, connection: sqlite3.Connection | None = None, clock: Clock | None = None, back_swing_window_seconds: int = 30) -> None:
         self.connection = connection or get_connection()
         ensure_network_schema(self.connection)
         self.clock = clock or SystemClock()
+        self.back_swing_window_seconds = back_swing_window_seconds
         self.repository = NetworkRepository(self.connection)
 
     def create_scenario(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -244,6 +245,108 @@ class NetworkAccelerationService:
                 self._event(connection, row["id"], "expired", actor, {}, now)
                 expired.append(row["id"])
         return {"expired": expired}
+
+    def migrate_session(self, session_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        session = self.repository.session_by_id(session_id)
+        if session is None:
+            raise NotFoundError("加速会话不存在")
+        segment = self.repository.segment_by_code(session["scenario_id"], payload["segment_code"])
+        if segment is None:
+            raise NotFoundError("场景区段不存在")
+        try:
+            parsed = from_storage(payload["observed_at"])
+        except ValueError as exc:
+            raise ValidationError("观测时间格式不正确") from exc
+        if parsed is None:
+            raise ValidationError("观测时间格式不正确")
+        observed = to_storage(parsed)
+        now = to_storage(self.clock.now())
+        from app.network.operations import NetworkOperationsService
+        operations = NetworkOperationsService(self.connection, self.clock)
+        try:
+            with transaction(immediate=True) as connection:
+                repository = NetworkRepository(connection)
+                existing = repository.migration_by_key(session_id, payload["observation_key"])
+                if existing is not None:
+                    if existing["to_segment_id"] != segment["id"] or existing["observed_at"] != observed:
+                        raise ConflictError("相同 observation_key 对应了不同观测内容")
+                    return self._migration_result(existing, duplicate=True)
+                current = repository.session_by_id(session_id)
+                if current["status"] != "active":
+                    raise ConflictError("只有进行中的加速会话可以迁移区段")
+                current_segment = repository.segment_by_id(current["segment_id"]) if current["segment_id"] else None
+                movement, result, reason = self._classify_movement(repository, current, current_segment, segment, observed, now, operations)
+                if result == "migrated":
+                    connection.execute(
+                        "UPDATE capacity_reservations SET segment_id=?,held_at=?,released_at=NULL,state='held' WHERE session_id=? AND state='held'",
+                        (segment["id"], now, session_id),
+                    )
+                    connection.execute(
+                        "UPDATE acceleration_sessions SET segment_id=?,version=version+1 WHERE id=? AND status='active'",
+                        (segment["id"], session_id),
+                    )
+                cursor = connection.execute(
+                    "INSERT INTO session_migrations(session_id,observation_key,from_segment_id,to_segment_id,movement,result,reason,downlink_mbps,uplink_mbps,observed_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (session_id, payload["observation_key"], current["segment_id"], segment["id"], movement, result, reason, current["allocated_downlink_mbps"], current["allocated_uplink_mbps"], observed, now),
+                )
+                detail = {
+                    "from_segment_code": current_segment["code"] if current_segment else None,
+                    "to_segment_code": segment["code"],
+                    "movement": movement,
+                    "observed_at": observed,
+                }
+                if result == "migrated":
+                    self._event(connection, session_id, "migrated", payload["actor"], detail, now)
+                elif result == "held":
+                    self._event(connection, session_id, "migration_held", payload["actor"], {**detail, "reason": reason}, now)
+                return self._migration_result(repository.migration_by_id(cursor.lastrowid))
+        except sqlite3.IntegrityError:
+            recorded = self.repository.migration_by_key(session_id, payload["observation_key"])
+            if recorded is None:  # pragma: no cover - 并发冲突后必然能读到已提交记录
+                raise
+            return self._migration_result(recorded, duplicate=True)
+
+    def _classify_movement(
+        self,
+        repository: NetworkRepository,
+        session: sqlite3.Row,
+        current_segment: sqlite3.Row | None,
+        target_segment: sqlite3.Row,
+        observed: str,
+        now: str,
+        operations: Any,
+    ) -> tuple[str, str, str]:
+        watermark = repository.last_observation_at(session["id"])
+        if watermark is None or watermark < session["started_at"]:
+            watermark = session["started_at"]
+        if observed <= watermark:
+            return "out_of_order", "rejected", "观测时间不晚于已处理的观测，会话保持当前区段"
+        if current_segment is not None and target_segment["id"] == current_segment["id"]:
+            return "same_segment", "ignored", "观测区段与当前预留区段一致"
+        if current_segment is not None and target_segment["sequence_no"] < current_segment["sequence_no"]:
+            reference = repository.last_migrated_observed_at(session["id"]) or session["started_at"]
+            elapsed = (from_storage(observed) - from_storage(reference)).total_seconds()
+            if target_segment["sequence_no"] == current_segment["sequence_no"] - 1 and elapsed <= self.back_swing_window_seconds:
+                return "back_swing", "ignored", "区段边界短时回摆，保留当前区段预留"
+            return "regression", "rejected", "观测区段位于当前区段之前，会话不能倒退"
+        movement = "forward" if current_segment is None or target_segment["sequence_no"] == current_segment["sequence_no"] + 1 else "skip"
+        maintenance = operations.blocks_new_session(session["scenario_id"], target_segment["id"], now)
+        if maintenance is not None:
+            return movement, "held", f"目标区段处于维护窗口 {maintenance['code']}，保留原区段预留"
+        scenario = repository.scenario_by_id(session["scenario_id"])
+        used = repository.active_capacity(session["scenario_id"], target_segment["id"])
+        if used["sessions"] >= int(scenario["max_concurrent_sessions"]):
+            return movement, "held", "目标区段并发加速会话已达到上限，保留原区段预留"
+        if used["downlink_mbps"] + float(session["allocated_downlink_mbps"]) > int(target_segment["capacity_mbps"]):
+            return movement, "held", "目标区段下行加速容量不足，保留原区段预留"
+        return movement, "migrated", "已释放原区段预留并获取目标区段预留"
+
+    @staticmethod
+    def _migration_result(row: sqlite3.Row, *, duplicate: bool = False) -> dict[str, Any]:
+        result = dict(row)
+        if duplicate:
+            result["duplicate"] = True
+        return result
 
     def open_incidents(self, scenario_code: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         scenario_id = self._scenario(scenario_code)["id"] if scenario_code else None

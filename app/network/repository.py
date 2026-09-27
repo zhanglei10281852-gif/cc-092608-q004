@@ -13,6 +13,14 @@ def rows_dict(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+MIGRATION_SELECT = (
+    "SELECT m.*,f.code AS from_segment_code,t.code AS to_segment_code "
+    "FROM session_migrations m "
+    "LEFT JOIN network_segments f ON f.id=m.from_segment_id "
+    "LEFT JOIN network_segments t ON t.id=m.to_segment_id "
+)
+
+
 class NetworkRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
@@ -132,6 +140,31 @@ class NetworkRepository:
             result.append(item)
         return result
 
+    def migration_by_key(self, session_id: int, observation_key: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            MIGRATION_SELECT + " WHERE m.session_id=? AND m.observation_key=?",
+            (session_id, observation_key),
+        ).fetchone()
+
+    def migration_by_id(self, migration_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(MIGRATION_SELECT + " WHERE m.id=?", (migration_id,)).fetchone()
+
+    def session_migrations(self, session_id: int) -> list[dict[str, Any]]:
+        return rows_dict(self.connection.execute(MIGRATION_SELECT + " WHERE m.session_id=? ORDER BY m.id", (session_id,)).fetchall())
+
+    def last_observation_at(self, session_id: int) -> str | None:
+        return self.connection.execute(
+            "SELECT MAX(observed_at) FROM session_migrations WHERE session_id=?",
+            (session_id,),
+        ).fetchone()[0]
+
+    def last_migrated_observed_at(self, session_id: int) -> str | None:
+        row = self.connection.execute(
+            "SELECT observed_at FROM session_migrations WHERE session_id=? AND result='migrated' ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return row[0] if row else None
+
     def active_capacity(self, scenario_id: int, segment_id: int | None) -> dict[str, float]:
         row = self.connection.execute(
             "SELECT COALESCE(SUM(downlink_mbps),0),COALESCE(SUM(uplink_mbps),0),COUNT(*) "
@@ -153,6 +186,7 @@ class NetworkRepository:
             return None
         result = dict(row)
         result["events"] = self.session_events(session_id)
+        result["migrations"] = self.session_migrations(session_id)
         reservation = self.connection.execute(
             "SELECT * FROM capacity_reservations WHERE session_id=?",
             (session_id,),
