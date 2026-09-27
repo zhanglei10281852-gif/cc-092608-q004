@@ -4,7 +4,7 @@ from fastapi import APIRouter, Query
 
 from app.database import get_connection
 from app.network.analytics import NetworkAnalytics, ReportWindow
-from app.network.schemas import AccelerationStart, ApplicationCreate, BatchSamples, EntitlementCreate, ExperienceSampleCreate, PolicyCreate, PolicyPublish, ScenarioCreate, SegmentCreate, SessionFinish
+from app.network.schemas import AccelerationStart, ApplicationCreate, BatchSamples, EntitlementCreate, ExperienceSampleCreate, PolicyCreate, PolicyPublish, ScenarioCreate, SegmentCreate, SessionFinish, SessionMigration
 from app.network.service import NetworkAccelerationService
 
 router = APIRouter(prefix="/api/network", tags=["5G-A 场景加速"])
@@ -82,6 +82,11 @@ def get_session(session_id: int):
 @router.post("/sessions/{session_id}/finish")
 def finish_session(session_id: int, payload: SessionFinish):
     return service().finish_session(session_id, payload.actor, payload.reason, payload.result)
+
+
+@router.post("/sessions/{session_id}/migrations")
+def migrate_session(session_id: int, payload: SessionMigration):
+    return service().migrate_session(session_id, payload.model_dump(), payload.actor)
 
 
 @router.post("/sessions/expire")

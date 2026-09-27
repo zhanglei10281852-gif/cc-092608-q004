@@ -229,6 +229,143 @@ class NetworkAccelerationService:
             self._event(connection, session_id, result, actor, {"reason": reason}, now)
             return NetworkRepository(connection).session_detail(session_id)
 
+    REWIND_TOLERANCE_SECONDS = 120
+
+    def migrate_session(self, session_id: int, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        """按位置观测把加速会话从当前区段迁移到目标区段。
+
+        - 同键重复观测直接返回首次判定结果，不重复扣减容量；
+        - 前进/跳段要求观测时间严格新于会话当前锚点；回摆只允许相邻区段且在
+          回摆容忍窗口内；其余方向判定为倒退并拒绝；
+        - 释放旧预留与持有新预留发生在同一个 IMMEDIATE 事务中；
+        - 新段容量不足等失败原因只记录为 rejected，会话继续保留在旧区段。
+        """
+        session = self.repository.session_by_id(session_id)
+        if session is None:
+            raise NotFoundError("加速会话不存在")
+        try:
+            observed_value = from_storage(payload["observed_at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidationError("观测时间格式不正确") from exc
+        observed = to_storage(observed_value)
+        observation_key = payload["observation_key"]
+        duplicate = self.repository.migration_by_key(session_id, observation_key)
+        if duplicate is not None:
+            return self._migration_observation(session_id, duplicate)
+        target = self.repository.segment_by_code(session["scenario_id"], payload["segment_code"])
+        if target is None:
+            raise NotFoundError("目标区段不存在")
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        downlink = float(session["allocated_downlink_mbps"])
+        uplink = float(session["allocated_uplink_mbps"])
+        with transaction(immediate=True) as connection:
+            repository = NetworkRepository(connection)
+            session = repository.session_by_id(session_id)
+            duplicate = repository.migration_by_key(session_id, observation_key)
+            if duplicate is not None:
+                return self._migration_observation(session_id, duplicate, repository)
+            current = repository.segment_by_id(session["segment_id"]) if session["segment_id"] else None
+            if session["status"] != "active":
+                return self._insert_migration_observation(connection, repository, session, current, target, observation_key, "stay", "rejected", "session_not_active", observed, now, actor)
+            if target["status"] != "active":
+                return self._insert_migration_observation(connection, repository, session, current, target, observation_key, "stay", "rejected", "target_segment_unavailable", observed, now, actor)
+            anchor = repository.latest_position_observation(session_id)
+            anchor_observed = anchor["observed_at"] if anchor is not None else repository.session_anchor_observed_at(session_id)
+            delta = int(target["sequence_no"]) - int(current["sequence_no"] if current else target["sequence_no"])
+            if current is None:
+                direction, allowed, reason = "forward", True, ""
+            elif delta == 0:
+                direction = "stay"
+                allowed, reason = (True, "same_segment") if observed > anchor_observed else (False, "stale_observation")
+            elif delta > 0:
+                direction = "skip" if delta > 1 else "forward"
+                allowed, reason = (True, "") if observed > anchor_observed else (False, "stale_observation")
+            elif delta == -1:
+                direction = "rewind"
+                if observed <= anchor_observed:
+                    allowed, reason = False, "stale_observation"
+                elif from_storage(observed) - from_storage(anchor_observed) > timedelta(seconds=self.REWIND_TOLERANCE_SECONDS):
+                    allowed, reason = False, "rewind_window_closed"
+                else:
+                    allowed, reason = True, ""
+            else:
+                direction, allowed, reason = "backward", False, "backward_movement_forbidden"
+            if not allowed:
+                return self._insert_migration_observation(connection, repository, session, current, target, observation_key, direction, "rejected", reason, observed, now, actor)
+            if direction == "stay":
+                return self._insert_migration_observation(connection, repository, session, current, target, observation_key, "stay", "unchanged", reason, observed, now, actor)
+            from app.network.operations import NetworkOperationsService
+            maintenance = NetworkOperationsService(connection, self.clock).blocks_new_session(session["scenario_id"], target["id"], now)
+            if maintenance is not None:
+                return self._insert_migration_observation(connection, repository, session, current, target, observation_key, direction, "rejected", "target_in_maintenance", observed, now, actor, {"maintenance_code": maintenance["code"]})
+            scenario = repository.scenario_by_id(session["scenario_id"])
+            used = repository.active_capacity(session["scenario_id"], target["id"])
+            if used["sessions"] >= int(scenario["max_concurrent_sessions"]):
+                return self._insert_migration_observation(connection, repository, session, current, target, observation_key, direction, "rejected", "scenario_session_limit", observed, now, actor)
+            if used["downlink_mbps"] + downlink > float(target["capacity_mbps"]):
+                return self._insert_migration_observation(
+                    connection, repository, session, current, target, observation_key, direction, "rejected", "target_capacity_insufficient", observed, now, actor,
+                    {
+                        "capacity_mbps": int(target["capacity_mbps"]),
+                        "held_downlink_mbps": round(used["downlink_mbps"], 3),
+                        "requested_downlink_mbps": round(downlink, 3),
+                    },
+                )
+            held = repository.held_reservation(session_id)
+            connection.execute(
+                "UPDATE capacity_reservations SET state='released',released_at=? WHERE id=? AND state='held'",
+                (now, held["id"] if held else -1),
+            )
+            connection.execute(
+                "INSERT INTO capacity_reservations(session_id,scenario_id,segment_id,downlink_mbps,uplink_mbps,held_at) VALUES(?,?,?,?,?,?)",
+                (session_id, session["scenario_id"], target["id"], downlink, uplink, now),
+            )
+            connection.execute(
+                "UPDATE acceleration_sessions SET segment_id=?,version=version+1 WHERE id=?",
+                (target["id"], session_id),
+            )
+            return self._insert_migration_observation(connection, repository, session, current, target, observation_key, direction, "migrated", "", observed, now, actor)
+
+    def _insert_migration_observation(self, connection, repository, session, current, target, observation_key, direction, result, reason, observed, now, actor, detail=None) -> dict[str, Any]:
+        detail = dict(detail or {})
+        cursor = connection.execute(
+            "INSERT INTO session_segment_migrations(scenario_id,session_id,from_segment_id,to_segment_id,observation_key,direction,result,reason,observed_at,received_at,detail_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                session["scenario_id"], session["id"], current["id"] if current else None, target["id"] if target else None,
+                observation_key, direction, result, reason, observed, now,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True), now,
+            ),
+        )
+        if result != "unchanged":
+            event_type = "segment_migrated" if result == "migrated" else "segment_migration_rejected"
+            self._event(
+                connection,
+                session["id"],
+                event_type,
+                actor,
+                {
+                    "from_segment": current["code"] if current else None,
+                    "to_segment": target["code"] if target else None,
+                    "direction": direction,
+                    "reason": reason,
+                    "observed_at": observed,
+                    "observation_key": observation_key,
+                    **detail,
+                },
+                now,
+            )
+        saved = connection.execute("SELECT * FROM session_segment_migrations WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return self._migration_observation(session["id"], saved, repository)
+
+    def _migration_observation(self, session_id: int, migration: sqlite3.Row, repository: NetworkRepository | None = None) -> dict[str, Any]:
+        repository = repository or self.repository
+        record = dict(migration)
+        record["detail"] = json.loads(record.pop("detail_json", "{}") or "{}")
+        detail = repository.session_detail(session_id)
+        return {"migration": record, "session": detail}
+
     def expire_sessions(self, actor: str = "session-reaper") -> dict[str, Any]:
         now = to_storage(self.clock.now())
         rows = self.connection.execute("SELECT id FROM acceleration_sessions WHERE status='active' AND expires_at<=? ORDER BY id", (now,)).fetchall()

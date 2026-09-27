@@ -121,9 +121,27 @@ CREATE TABLE IF NOT EXISTS capacity_reservations (
     uplink_mbps REAL NOT NULL,
     state TEXT NOT NULL DEFAULT 'held' CHECK(state IN ('held','released')),
     held_at TEXT NOT NULL,
-    released_at TEXT,
-    UNIQUE(session_id)
+    released_at TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_held
+    ON capacity_reservations(session_id) WHERE state='held';
+CREATE TABLE IF NOT EXISTS session_segment_migrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES acceleration_sessions(id) ON DELETE CASCADE,
+    scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
+    from_segment_id INTEGER REFERENCES network_segments(id),
+    to_segment_id INTEGER REFERENCES network_segments(id),
+    observation_key TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK(direction IN ('forward','rewind','skip','stay','backward')),
+    result TEXT NOT NULL CHECK(result IN ('migrated','unchanged','rejected')),
+    reason TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, observation_key)
+);
+CREATE INDEX IF NOT EXISTS idx_session_migrations ON session_segment_migrations(session_id,id);
 CREATE TABLE IF NOT EXISTS session_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL REFERENCES acceleration_sessions(id) ON DELETE CASCADE,
@@ -204,3 +222,37 @@ CREATE INDEX IF NOT EXISTS idx_operation_events_resource ON operation_events(res
 
 def ensure_network_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(NETWORK_SCHEMA)
+    _migrate_legacy_reservations(connection)
+
+
+def _migrate_legacy_reservations(connection: sqlite3.Connection) -> None:
+    """旧版本的 capacity_reservations 带 UNIQUE(session_id)，无法保存跨区段的
+    预留历史；检测到旧表时重建为“一会话多行 + held 部分唯一索引”结构。"""
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='capacity_reservations'"
+    ).fetchone()
+    if row is None or "UNIQUE(session_id)" not in (row[0] or ""):
+        return
+    connection.executescript(
+        """
+        CREATE TABLE capacity_reservations_migrated (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL REFERENCES acceleration_sessions(id) ON DELETE CASCADE,
+            scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
+            segment_id INTEGER REFERENCES network_segments(id),
+            downlink_mbps REAL NOT NULL,
+            uplink_mbps REAL NOT NULL,
+            state TEXT NOT NULL DEFAULT 'held' CHECK(state IN ('held','released')),
+            held_at TEXT NOT NULL,
+            released_at TEXT
+        );
+        INSERT INTO capacity_reservations_migrated
+            (id,session_id,scenario_id,segment_id,downlink_mbps,uplink_mbps,state,held_at,released_at)
+        SELECT id,session_id,scenario_id,segment_id,downlink_mbps,uplink_mbps,state,held_at,released_at
+        FROM capacity_reservations;
+        DROP TABLE capacity_reservations;
+        ALTER TABLE capacity_reservations_migrated RENAME TO capacity_reservations;
+        CREATE UNIQUE INDEX idx_reservations_held
+            ON capacity_reservations(session_id) WHERE state='held';
+        """
+    )

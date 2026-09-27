@@ -140,6 +140,59 @@ class NetworkRepository:
         ).fetchone()
         return {"downlink_mbps": float(row[0]), "uplink_mbps": float(row[1]), "sessions": int(row[2])}
 
+    def held_reservation(self, session_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM capacity_reservations WHERE session_id=? AND state='held' LIMIT 1",
+            (session_id,),
+        ).fetchone()
+
+    def reservations(self, session_id: int) -> list[dict[str, Any]]:
+        return rows_dict(
+            self.connection.execute(
+                "SELECT * FROM capacity_reservations WHERE session_id=? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        )
+
+    def migration_by_key(self, session_id: int, observation_key: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM session_segment_migrations WHERE session_id=? AND observation_key=?",
+            (session_id, observation_key),
+        ).fetchone()
+
+    def latest_position_observation(self, session_id: int) -> sqlite3.Row | None:
+        """会话当前位置的时间锚点：最近一次成功迁移或同段停滞的观测。"""
+        return self.connection.execute(
+            "SELECT * FROM session_segment_migrations WHERE session_id=? AND result IN ('migrated','unchanged') ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+
+    def session_anchor_observed_at(self, session_id: int) -> str | None:
+        """首次迁移之前的顺序锚点：触发该会话的质差样本观测时间。"""
+        return self.connection.execute(
+            "SELECT x.observed_at FROM acceleration_sessions s "
+            "JOIN quality_incidents i ON i.id=s.incident_id "
+            "JOIN experience_samples x ON x.id=i.sample_id WHERE s.id=?",
+            (session_id,),
+        ).fetchone()[0]
+
+    def session_migrations(self, session_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT m.*,f.code AS from_segment_code,f.name AS from_segment_name,"
+            "t.code AS to_segment_code,t.name AS to_segment_name "
+            "FROM session_segment_migrations m "
+            "LEFT JOIN network_segments f ON f.id=m.from_segment_id "
+            "LEFT JOIN network_segments t ON t.id=m.to_segment_id "
+            "WHERE m.session_id=? ORDER BY m.id",
+            (session_id,),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["detail"] = json.loads(item.pop("detail_json"))
+            result.append(item)
+        return result
+
     def active_entitlement(self, subscriber_hash: str, scenario_id: int, now: str) -> sqlite3.Row | None:
         return self.connection.execute(
             "SELECT * FROM subscriber_entitlements WHERE subscriber_hash=? AND scenario_id=? AND state='active' "
@@ -153,11 +206,20 @@ class NetworkRepository:
             return None
         result = dict(row)
         result["events"] = self.session_events(session_id)
+        result["migrations"] = self.session_migrations(session_id)
+        result["reservations"] = self.reservations(session_id)
         reservation = self.connection.execute(
-            "SELECT * FROM capacity_reservations WHERE session_id=?",
+            "SELECT * FROM capacity_reservations WHERE session_id=? ORDER BY id DESC LIMIT 1",
             (session_id,),
         ).fetchone()
         result["reservation"] = row_dict(reservation)
+        segment = None
+        if result.get("segment_id") is not None:
+            segment = self.connection.execute(
+                "SELECT code,name,sequence_no FROM network_segments WHERE id=?",
+                (result["segment_id"],),
+            ).fetchone()
+        result["segment"] = row_dict(segment)
         return result
 
     def summary(self) -> dict[str, Any]:

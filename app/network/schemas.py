@@ -77,6 +77,13 @@ class SessionFinish(BaseModel):
     result: Literal["completed", "cancelled"] = "completed"
 
 
+class SessionMigration(BaseModel):
+    segment_code: str = Field(min_length=1, max_length=64)
+    observed_at: str
+    observation_key: str = Field(min_length=6, max_length=160)
+    actor: str = Field(min_length=1, max_length=120)
+
+
 class BatchSamples(BaseModel):
     items: list[ExperienceSampleCreate] = Field(min_length=1, max_length=500)
 
